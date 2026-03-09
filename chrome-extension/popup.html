@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 340px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 20px;
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 16px;
+    }
+    .header h1 {
+      font-size: 18px;
+      color: #60a5fa;
+    }
+    .header p {
+      font-size: 11px;
+      color: #94a3b8;
+      margin-top: 4px;
+    }
+    .header .target-app {
+      display: inline-block;
+      background: #1e40af;
+      color: #93c5fd;
+      font-size: 10px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      margin-top: 6px;
+    }
+    .status-box {
+      background: #1e293b;
+      border-radius: 10px;
+      padding: 16px;
+      text-align: center;
+      margin-bottom: 16px;
+      border: 1px solid #334155;
+    }
+    .status-indicator {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      margin-right: 8px;
+      vertical-align: middle;
+    }
+    .status-indicator.inactive { background: #ef4444; }
+    .status-indicator.active { background: #22c55e; animation: pulse 1.5s infinite; }
+    .status-indicator.processing { background: #f59e0b; animation: pulse 0.8s infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    .status-text {
+      font-size: 14px;
+      font-weight: 600;
+      vertical-align: middle;
+    }
+    .mic-level {
+      margin-top: 10px;
+      height: 4px;
+      background: #334155;
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .mic-level-bar {
+      height: 100%;
+      background: #22c55e;
+      border-radius: 2px;
+      transition: width 0.1s;
+      width: 0%;
+    }
+    .mic-label {
+      font-size: 10px;
+      color: #64748b;
+      margin-top: 4px;
+    }
+    .btn {
+      width: 100%;
+      padding: 12px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      margin-bottom: 8px;
+    }
+    .btn-start {
+      background: #2563eb;
+      color: white;
+    }
+    .btn-start:hover { background: #1d4ed8; }
+    .btn-stop {
+      background: #dc2626;
+      color: white;
+    }
+    .btn-stop:hover { background: #b91c1c; }
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .settings {
+      margin-top: 12px;
+      background: #1e293b;
+      border-radius: 10px;
+      padding: 12px;
+      border: 1px solid #334155;
+    }
+    .settings h3 {
+      font-size: 12px;
+      color: #94a3b8;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .setting-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 0;
+      font-size: 13px;
+    }
+    .setting-row label { color: #cbd5e1; }
+    .setting-row input[type="number"] {
+      width: 60px;
+      padding: 4px 8px;
+      border-radius: 4px;
+      border: 1px solid #475569;
+      background: #0f172a;
+      color: #e2e8f0;
+      font-size: 12px;
+      text-align: center;
+    }
+    .setting-row input[type="checkbox"] {
+      width: auto;
+      accent-color: #2563eb;
+    }
+    .log-box {
+      margin-top: 12px;
+      background: #020617;
+      border-radius: 8px;
+      padding: 10px;
+      max-height: 140px;
+      overflow-y: auto;
+      font-family: 'Courier New', monospace;
+      font-size: 11px;
+      border: 1px solid #1e293b;
+    }
+    .log-entry {
+      padding: 2px 0;
+      color: #64748b;
+    }
+    .log-entry.action { color: #22c55e; }
+    .log-entry.error { color: #ef4444; }
+    .log-entry.info { color: #60a5fa; }
+    .backend-input {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid #475569;
+      background: #0f172a;
+      color: #e2e8f0;
+      font-size: 12px;
+      margin-bottom: 12px;
+      font-family: 'Courier New', monospace;
+    }
+    .backend-input::placeholder { color: #475569; }
+    .tips {
+      margin-top: 12px;
+      background: #1a1a2e;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 10px;
+    }
+    .tips h4 {
+      font-size: 11px;
+      color: #60a5fa;
+      margin-bottom: 6px;
+    }
+    .tips p {
+      font-size: 10px;
+      color: #64748b;
+      line-height: 1.4;
+      margin-bottom: 4px;
+    }
+    .command-box {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+    .command-input {
+      flex: 1;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid #475569;
+      background: #1e293b;
+      color: #e2e8f0;
+      font-size: 13px;
+      outline: none;
+      resize: vertical;
+      min-height: 40px;
+      max-height: 120px;
+      font-family: inherit;
+      line-height: 1.4;
+    }
+    .command-input:focus {
+      border-color: #2563eb;
+    }
+    .command-input::placeholder { color: #64748b; }
+    .command-input:disabled { opacity: 0.4; }
+    .btn-send {
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      background: #2563eb;
+      color: white;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .btn-send:hover { background: #1d4ed8; }
+    .btn-send:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-mic {
+      padding: 10px 12px;
+      border: none;
+      border-radius: 8px;
+      background: #334155;
+      color: #94a3b8;
+      font-size: 16px;
+      cursor: pointer;
+      transition: all 0.2s;
+      white-space: nowrap;
+      line-height: 1;
+    }
+    .btn-mic:hover { background: #475569; }
+    .btn-mic:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-mic.listening {
+      background: #dc2626;
+      color: white;
+      animation: pulse 0.8s infinite;
+    }
+    .btn-mic.ready {
+      background: #16a34a;
+      color: white;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h1>♿ Accessibility Autopilot</h1>
+    <p>Voice-Controlled Screen Agent</p>
+    <span class="target-app">📧 Outlook 365 Edition</span>
+  </div>
+
+  <div class="status-box">
+    <span id="statusDot" class="status-indicator inactive"></span>
+    <span id="statusText" class="status-text">Inactive</span>
+  </div>
+
+  <input
+    type="text"
+    id="backendUrl"
+    class="backend-input"
+    placeholder="wss://your-backend.run.app/ws"
+    value="ws://localhost:8080/ws"
+  />
+
+  <button id="startBtn" class="btn btn-start">
+    🎙️ Start Autopilot
+  </button>
+  <button id="stopBtn" class="btn btn-stop" disabled>
+    ⏹️ Stop
+  </button>
+
+  <div class="command-box">
+    <textarea id="commandInput" class="command-input" rows="2"
+              placeholder="Type a command... (Ctrl+Enter to send)"
+              disabled></textarea>
+    <button id="micBtn" class="btn-mic" disabled title="Voice input (enable Audio in Settings)">🎤</button>
+    <button id="sendBtn" class="btn-send" disabled>Send</button>
+  </div>
+
+  <div class="settings">
+    <h3>Settings</h3>
+    <div class="setting-row">
+      <label>Screenshot interval (ms)</label>
+      <input type="number" id="captureInterval" value="1500" min="500" max="5000" step="100" />
+    </div>
+    <div class="setting-row">
+      <label>Image quality (%)</label>
+      <input type="number" id="imageQuality" value="90" min="30" max="100" step="5" />
+    </div>
+    <div class="setting-row">
+      <label>Review voice before send</label>
+      <input type="checkbox" id="confirmActions" />
+    </div>
+    <div class="setting-row">
+      <label>Enable Audio (mic + voice)</label>
+      <input type="checkbox" id="enableAudio" checked />
+    </div>
+  </div>
+
+  <div class="log-box" id="logBox">
+    <div class="log-entry info">Ready. Open Outlook 365 in a tab, enter backend URL, and click Start.</div>
+  </div>
+
+  <div class="tips">
+    <h4>💡 Tips for Outlook</h4>
+    <p>• Open outlook.office.com in a tab before starting</p>
+    <p>• Set browser zoom to exactly 100%</p>
+    <p>• Use light mode for best accuracy</p>
+    <p>• Type commands: "open the first email", "reply", "send"</p>
+  </div>
+
+  <script src="popup.js"></script>
+
+</body>
+</html>

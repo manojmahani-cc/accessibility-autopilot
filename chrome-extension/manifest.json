@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Accessibility Autopilot",
+  "description": "Voice-controlled screen agent for users with motor disabilities. Works with Outlook 365 and any web app.",
+  "version": "2.0",
+  "permissions": [
+    "tabCapture",
+    "debugger",
+    "activeTab",
+    "tabs",
+    "tts"
+  ],
+  "host_permissions": [
+    "https://outlook.office.com/*",
+    "https://outlook.office365.com/*",
+    "https://outlook.live.com/*",
+    "https://*.office.com/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Accessibility Autopilot"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}
