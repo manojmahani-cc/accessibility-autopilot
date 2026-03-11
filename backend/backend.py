@@ -1,11 +1,16 @@
 import os
 import io
 import json
+import uuid
+import time
 import base64
 import asyncio
 import logging
+from collections import defaultdict
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv()
@@ -15,6 +20,20 @@ logger = logging.getLogger("autopilot")
 
 app = FastAPI(title="Accessibility Autopilot - Outlook Edition")
 
+# Allow CORS for Chrome extension HTTP polling
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─────────────────────────────────────────────────────────────
+# HTTP Polling Session Store
+# ─────────────────────────────────────────────────────────────
+sessions: dict = {}  # session_id -> session state
+SESSION_TTL = 600  # seconds before a session expires
+
 # ─────────────────────────────────────────────────────────────
 # Gemini Client Setup
 # ─────────────────────────────────────────────────────────────
@@ -23,9 +42,9 @@ from google.genai import types
 
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
-    raise ValueError("GEMINI_API_KEY environment variable is required")
+    logger.warning("GEMINI_API_KEY not set — Gemini calls will fail until it is configured")
 
-client = genai.Client(api_key=api_key)
+client = genai.Client(api_key=api_key) if api_key else None
 
 # ─────────────────────────────────────────────────────────────
 # System Prompt — Outlook 365 Specific
@@ -125,8 +144,22 @@ Always respond with valid JSON in this exact structure:
   "key": "Delete",
   "direction": "down",
   "confirmation": "Spoken message to say to the user",
-  "description": "Screen description if action is describe"
+  "description": "Screen description if action is describe",
+  "task_complete": false
 }
+
+TASK_COMPLETE FIELD (CRITICAL):
+- Set "task_complete": true when this single action fully completes the user's request.
+  Examples: "open sent items" → click Sent Items → task_complete: true.
+  "scroll down" → scroll → task_complete: true.
+  "read this email" → describe → task_complete: true.
+- Set "task_complete": false ONLY when you know more actions are needed after this one.
+  Examples: "reply saying I'll be there Monday" → click Reply → task_complete: false
+  (because you still need to type the message and click Send).
+- NEVER invent follow-up actions. If the user said "open sent items", do NOT then
+  start reading emails or performing other actions. Only do what was asked.
+- When in doubt, set task_complete: true. It is better to stop and wait for the
+  user's next command than to perform unwanted actions.
 
 IMPORTANT FIELD RULES:
 - For click actions, ALWAYS include "target_text" — the exact visible
@@ -139,10 +172,11 @@ IMPORTANT FIELD RULES:
   in the wrong field.
 
 Examples:
-- Click folder: {"action": "click", "x": 170, "y": 400, "grid_cell": 55, "target_text": "Inbox", "confirmation": "Opening your Inbox"}
-- Click folder: {"action": "click", "x": 170, "y": 500, "grid_cell": 70, "target_text": "Sent Items", "confirmation": "Opening Sent Items"}
-- Click button: {"action": "click", "x": 140, "y": 75, "grid_cell": 3, "target_text": "New mail", "confirmation": "Opening a new email"}
-- Click email: {"action": "click", "x": 600, "y": 420, "grid_cell": 250, "target_text": "Suraj Chawla in Teams", "confirmation": "Opening the email from Suraj"}
+- Click folder: {"action": "click", "x": 170, "y": 400, "grid_cell": 55, "target_text": "Inbox", "confirmation": "Opening your Inbox", "task_complete": true}
+- Click folder: {"action": "click", "x": 170, "y": 500, "grid_cell": 70, "target_text": "Sent Items", "confirmation": "Opening Sent Items", "task_complete": true}
+- Click button: {"action": "click", "x": 140, "y": 75, "grid_cell": 3, "target_text": "New mail", "confirmation": "Opening a new email", "task_complete": true}
+- Click email: {"action": "click", "x": 600, "y": 420, "grid_cell": 250, "target_text": "Jessica C in Teams", "confirmation": "Opening the email from Jessica", "task_complete": true}
+- Reply with message: {"action": "click", "x": 422, "y": 104, "grid_cell": 10, "target_text": "Reply", "confirmation": "Clicking Reply to start your response", "task_complete": false}
 - Type in subject: {"action": "type", "text": "Project Update", "target_field": "subject", "confirmation": "Adding the subject line"}
 - Type in body: {"action": "type", "text": "Hi team,\nHere is the update.\nThanks,\nAgent", "target_field": "body", "confirmation": "Typing the email body"}
   (Use \\n in text for line breaks — each \\n will create a new line in the email)
@@ -159,8 +193,12 @@ CRITICAL RULES:
 1. ALWAYS respond with ONLY valid JSON — no extra text before or after the JSON.
    Do not add explanations, just the JSON object.
 2. ALWAYS speak your action before performing it via the "confirmation" field.
-3. Before DESTRUCTIVE actions (Send, Delete, Move), set action to "confirm"
-   FIRST and wait for user approval. Only execute after they say yes.
+3. ONLY use "confirm" for DESTRUCTIVE actions: Send email, Delete email, Reply email or
+   Move email. These are the ONLY actions that need confirmation.
+   Do NOT confirm for: opening emails, clicking folders, forwarding,
+   composing, typing, scrolling, or any other non-destructive action.
+   When the user explicitly asks to do something (e.g., "open email from John"),
+   just DO IT immediately — do not ask for confirmation.
 4. If the UI shows a loading spinner or skeleton screen, respond with
    {"action": "wait"} and ask for a new screenshot after 2 seconds.
 5. If the command is ambiguous (multiple matching elements), use "clarify".
@@ -351,6 +389,9 @@ async def agent_endpoint(websocket: WebSocket):
     conversation_history = []  # Maintains context across turns
     latest_screenshot_parts = None  # Most recent screenshot parts for Gemini
     current_image_width = 1920  # Track actual image width for grid conversion
+    pending_task = None  # Tracks multi-step tasks awaiting completion
+    last_action = None   # Last action sent to the client
+    auto_continuing = False  # Prevents overlapping auto-continue calls
 
     try:
         # Send welcome message
@@ -379,8 +420,13 @@ async def agent_endpoint(websocket: WebSocket):
                 screenshot_b64 = data["data"]
 
                 # Check if screen has changed since last capture
-                if screenshots_are_similar(last_screenshot, screenshot_b64):
+                # Skip similarity check when a multi-step task is in progress —
+                # we need every post-action screenshot to trigger auto-continue
+                is_similar = screenshots_are_similar(last_screenshot, screenshot_b64)
+                if not pending_task and is_similar:
                     continue  # Skip if nothing changed — saves API calls
+                if pending_task:
+                    logger.info(f"Pending task active, processing screenshot (similar={is_similar})")
 
                 last_screenshot = screenshot_b64
 
@@ -405,6 +451,64 @@ async def agent_endpoint(websocket: WebSocket):
                 ]
                 logger.info(f"Screenshot captured ({img_w}x{img_h}, with grid), ready for next command")
 
+                # Auto-continue: if there's a pending multi-step task, ask Gemini for next step
+                if pending_task and last_action and last_action not in ("speak", "describe", "clarify", "error") and not auto_continuing:
+                    auto_continuing = True
+                    logger.info(f"Auto-continuing pending task: {pending_task}")
+                    parts = list(latest_screenshot_parts)
+                    parts.append(types.Part(
+                        text=f"The previous action has been executed and the screen has updated. "
+                             f"The original user request was: \"{pending_task}\". "
+                             f"Look at the new screenshot. If the task is fully complete, respond with: "
+                             f'{{\"action\": \"speak\", \"confirmation\": \"Done. <brief summary>\"}}\n'
+                             f"If more steps are needed, respond with the next single action to perform."
+                    ))
+                    conversation_history.append(
+                        types.Content(role="user", parts=parts)
+                    )
+                    if len(conversation_history) > MAX_HISTORY:
+                        conversation_history = conversation_history[-MAX_HISTORY:]
+
+                    try:
+                        response_text = await call_gemini(conversation_history)
+                        logger.info(f"Gemini auto-continue response: {response_text[:200]}")
+
+                        conversation_history.append(
+                            types.Content(role="model", parts=[
+                                types.Part(text=response_text)
+                            ])
+                        )
+
+                        try:
+                            action = parse_gemini_response(response_text, current_image_width)
+                            await websocket.send_json(action)
+                            last_action = action.get("action")
+                            task_complete = action.get("task_complete", True)
+                            logger.info(f"Auto-continue action sent: {last_action}, task_complete={task_complete}")
+
+                            # Clear pending task if the model says it's done
+                            if task_complete or last_action in ("speak", "describe", "clarify"):
+                                pending_task = None
+                                last_action = None
+                        except json.JSONDecodeError:
+                            await websocket.send_json({
+                                "action": "speak",
+                                "confirmation": response_text
+                            })
+                            pending_task = None
+                            last_action = None
+
+                    except Exception as e:
+                        logger.error(f"Auto-continue Gemini error: {e}", exc_info=True)
+                        await websocket.send_json({
+                            "action": "speak",
+                            "confirmation": "Sorry, I had trouble continuing. Could you try again?"
+                        })
+                        pending_task = None
+                        last_action = None
+                    finally:
+                        auto_continuing = False
+
             elif data["type"] == "command":
                 # User sends a text command (typed or transcribed from voice)
                 user_text = data.get("text", "").strip()
@@ -412,6 +516,9 @@ async def agent_endpoint(websocket: WebSocket):
                     continue
 
                 logger.info(f"User command: {user_text}")
+
+                # Store as pending task for multi-step auto-continuation
+                pending_task = user_text
 
                 # Build the message parts: screenshot (if available) + text command
                 parts = []
@@ -444,13 +551,22 @@ async def agent_endpoint(websocket: WebSocket):
                     try:
                         action = parse_gemini_response(response_text, current_image_width)
                         await websocket.send_json(action)
-                        logger.info(f"Action sent to client: {action.get('action')}")
+                        last_action = action.get("action")
+                        task_complete = action.get("task_complete", True)
+                        logger.info(f"Action sent to client: {last_action}, task_complete={task_complete}")
+
+                        # Clear pending task if model says task is complete or it's a speech action
+                        if task_complete or last_action in ("speak", "describe", "clarify"):
+                            pending_task = None
+                            last_action = None
                     except json.JSONDecodeError:
                         # Gemini returned non-JSON text — treat as spoken response
                         await websocket.send_json({
                             "action": "speak",
                             "confirmation": response_text
                         })
+                        pending_task = None
+                        last_action = None
 
                 except Exception as e:
                     logger.error(f"Gemini API error: {e}", exc_info=True)
@@ -458,6 +574,8 @@ async def agent_endpoint(websocket: WebSocket):
                         "action": "speak",
                         "confirmation": "Sorry, I had trouble processing that. Could you try again?"
                     })
+                    pending_task = None
+                    last_action = None
 
             # elif data["type"] == "audio":
             #     # Audio input commented out for now — use text commands instead
@@ -519,6 +637,180 @@ async def agent_endpoint(websocket: WebSocket):
             })
         except Exception:
             pass
+
+
+# ─────────────────────────────────────────────────────────────
+# HTTP Polling Endpoints — Fallback when WebSocket is blocked
+# ─────────────────────────────────────────────────────────────
+
+class SendPayload(BaseModel):
+    session_id: str
+    type: str  # "screenshot", "command", "user_confirmation"
+    data: str | None = None
+    text: str | None = None
+    response: str | None = None
+    resolution: str | None = "1920x1080"
+    timestamp: int | None = None
+
+
+def cleanup_expired_sessions():
+    """Remove sessions older than SESSION_TTL."""
+    now = time.time()
+    expired = [sid for sid, s in sessions.items() if now - s["last_active"] > SESSION_TTL]
+    for sid in expired:
+        del sessions[sid]
+        logger.info(f"Session {sid[:8]} expired")
+
+
+@app.post("/api/connect")
+async def api_connect():
+    """Create a new polling session. Returns session_id and welcome message."""
+    cleanup_expired_sessions()
+    session_id = str(uuid.uuid4())
+    sessions[session_id] = {
+        "conversation_history": [],
+        "latest_screenshot_parts": None,
+        "current_image_width": 1920,
+        "last_screenshot": None,
+        "outbox": [],  # messages queued for the client
+        "last_active": time.time(),
+    }
+    # Queue welcome message
+    sessions[session_id]["outbox"].append({
+        "action": "speak",
+        "confirmation": "Autopilot is ready. I can see your screen. What would you like to do?"
+    })
+    logger.info(f"HTTP session created: {session_id[:8]}")
+    return {"session_id": session_id}
+
+
+@app.post("/api/send")
+async def api_send(payload: SendPayload):
+    """Receive data from the Chrome extension (screenshot, command, confirmation)."""
+    session = sessions.get(payload.session_id)
+    if not session:
+        return {"error": "invalid_session", "messages": []}
+
+    session["last_active"] = time.time()
+
+    if payload.type == "screenshot":
+        screenshot_b64 = payload.data
+        if not screenshot_b64:
+            return {"messages": session["outbox"][:]}
+
+        # Check if screen changed
+        if screenshots_are_similar(session["last_screenshot"], screenshot_b64):
+            # Return any queued messages even if screenshot unchanged
+            msgs = session["outbox"][:]
+            session["outbox"].clear()
+            return {"messages": msgs}
+
+        session["last_screenshot"] = screenshot_b64
+
+        resolution_str = payload.resolution or "1920x1080"
+        try:
+            img_w, img_h = map(int, resolution_str.split("x"))
+            session["current_image_width"] = img_w
+        except Exception:
+            img_w, img_h = 1920, 1080
+
+        gridded_screenshot = add_grid_overlay(screenshot_b64)
+        session["latest_screenshot_parts"] = [
+            types.Part(inline_data=types.Blob(
+                mime_type="image/jpeg",
+                data=base64.b64decode(gridded_screenshot)
+            )),
+            types.Part(text=f"New screenshot received ({img_w}x{img_h}). Grid overlay applied with {GRID_SIZE}px cells.")
+        ]
+        logger.info(f"[HTTP {payload.session_id[:8]}] Screenshot captured ({img_w}x{img_h})")
+
+    elif payload.type == "command":
+        user_text = (payload.text or "").strip()
+        if not user_text:
+            msgs = session["outbox"][:]
+            session["outbox"].clear()
+            return {"messages": msgs}
+
+        logger.info(f"[HTTP {payload.session_id[:8]}] Command: {user_text}")
+
+        parts = []
+        if session["latest_screenshot_parts"]:
+            parts.extend(session["latest_screenshot_parts"])
+        parts.append(types.Part(text=f"User command: {user_text}"))
+
+        session["conversation_history"].append(
+            types.Content(role="user", parts=parts)
+        )
+        if len(session["conversation_history"]) > MAX_HISTORY:
+            session["conversation_history"] = session["conversation_history"][-MAX_HISTORY:]
+
+        try:
+            response_text = await call_gemini(session["conversation_history"])
+            logger.info(f"[HTTP {payload.session_id[:8]}] Gemini: {response_text[:200]}")
+
+            session["conversation_history"].append(
+                types.Content(role="model", parts=[types.Part(text=response_text)])
+            )
+
+            try:
+                action = parse_gemini_response(response_text, session["current_image_width"])
+                session["outbox"].append(action)
+            except json.JSONDecodeError:
+                session["outbox"].append({"action": "speak", "confirmation": response_text})
+
+        except Exception as e:
+            logger.error(f"[HTTP {payload.session_id[:8]}] Gemini error: {e}", exc_info=True)
+            session["outbox"].append({
+                "action": "speak",
+                "confirmation": "Sorry, I had trouble processing that. Could you try again?"
+            })
+
+    elif payload.type == "user_confirmation":
+        confirmation = (payload.response or "").lower()
+        logger.info(f"[HTTP {payload.session_id[:8]}] Confirmation: {confirmation}")
+
+        session["conversation_history"].append(
+            types.Content(role="user", parts=[
+                types.Part(text=f"User responded to confirmation: '{confirmation}'")
+            ])
+        )
+        if len(session["conversation_history"]) > MAX_HISTORY:
+            session["conversation_history"] = session["conversation_history"][-MAX_HISTORY:]
+
+        try:
+            response_text = await call_gemini(session["conversation_history"])
+            session["conversation_history"].append(
+                types.Content(role="model", parts=[types.Part(text=response_text)])
+            )
+            try:
+                action = parse_gemini_response(response_text, session["current_image_width"])
+                session["outbox"].append(action)
+            except json.JSONDecodeError:
+                session["outbox"].append({"action": "speak", "confirmation": response_text})
+        except Exception as e:
+            logger.error(f"[HTTP {payload.session_id[:8]}] Gemini error: {e}", exc_info=True)
+            session["outbox"].append({
+                "action": "speak",
+                "confirmation": "Sorry, something went wrong. Please try again."
+            })
+
+    # Return all queued messages
+    msgs = session["outbox"][:]
+    session["outbox"].clear()
+    return {"messages": msgs}
+
+
+@app.get("/api/poll/{session_id}")
+async def api_poll(session_id: str):
+    """Poll for pending messages. Called by the extension between sends."""
+    session = sessions.get(session_id)
+    if not session:
+        return {"error": "invalid_session", "messages": []}
+
+    session["last_active"] = time.time()
+    msgs = session["outbox"][:]
+    session["outbox"].clear()
+    return {"messages": msgs}
 
 
 # ─────────────────────────────────────────────────────────────

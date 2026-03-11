@@ -1,6 +1,9 @@
 let isRunning = false;
 let recognition = null;
 let isListening = false;
+let recognitionResultOffset = 0; // tracks already-sent results so old text isn't repeated
+let recognitionResultCount = 0;  // total results seen so far
+let micPausedByTTS = false;      // true when mic is temporarily paused during TTS playback
 
 // ─────────────────────────────────────────────────────
 // Logging
@@ -46,6 +49,9 @@ function sendCommand() {
   chrome.runtime.sendMessage({ action: 'sendText', text: command });
   input.value = '';
   input.focus();
+
+  // Advance the offset so continuous recognition doesn't re-include sent text
+  recognitionResultOffset = recognitionResultCount;
 }
 
 // ─────────────────────────────────────────────────────
@@ -64,13 +70,29 @@ function setupSpeechRecognition() {
   recognition.lang = 'en-US';
 
   recognition.onresult = (event) => {
-    // Build full transcript from all result entries (continuous mode produces multiple)
+    recognitionResultCount = event.results.length;
+    // Only read results from the offset onwards so already-sent commands are excluded
     let fullTranscript = '';
-    for (let i = 0; i < event.results.length; i++) {
+    let allFinal = true;
+    for (let i = recognitionResultOffset; i < event.results.length; i++) {
       fullTranscript += event.results[i][0].transcript;
+      if (!event.results[i].isFinal) allFinal = false;
     }
-    // Live preview only — processing happens when user clicks 🎤 to stop
-    document.getElementById('commandInput').value = fullTranscript;
+    const text = fullTranscript.trim();
+    document.getElementById('commandInput').value = text;
+
+    // Auto-send when the user pauses and all pending results are final
+    const audioEnabled = document.getElementById('enableAudio').checked;
+    if (audioEnabled && allFinal && text) {
+      const reviewBeforeSend = document.getElementById('confirmActions').checked;
+      if (reviewBeforeSend) {
+        addLog('Voice (review): ' + text, 'info');
+        document.getElementById('commandInput').focus();
+      } else {
+        addLog('Voice: ' + text, 'info');
+        sendCommand();   // sends & advances recognitionResultOffset
+      }
+    }
   };
 
   recognition.onend = () => {
@@ -84,13 +106,20 @@ function setupSpeechRecognition() {
 
   recognition.onerror = (event) => {
     if (event.error === 'no-speech') {
-      addLog('No speech detected — try again', 'error');
+      // no-speech is normal during silence — don't kill listening when audio is enabled
+      const audioEnabled = document.getElementById('enableAudio').checked;
+      if (!audioEnabled || !isRunning) {
+        addLog('No speech detected — try again', 'error');
+        stopListening();
+      }
+      // otherwise onend will restart recognition automatically
     } else if (event.error === 'not-allowed') {
       addLog('Microphone access denied — check browser permissions', 'error');
+      stopListening();
     } else {
       addLog('Speech error: ' + event.error, 'error');
+      stopListening();
     }
-    stopListening();
   };
 
   return true;
@@ -99,17 +128,11 @@ function setupSpeechRecognition() {
 function toggleMic() {
   if (isListening) {
     recognition.stop();
-    // Finalize: process the accumulated transcript
+    // Send any pending text in the input
     const text = document.getElementById('commandInput').value.trim();
     if (text) {
-      const reviewBeforeSend = document.getElementById('confirmActions').checked;
-      if (reviewBeforeSend) {
-        addLog('Voice (review): ' + text, 'info');
-        document.getElementById('commandInput').focus();
-      } else {
-        addLog('Voice: ' + text, 'info');
-        sendCommand();
-      }
+      addLog('Voice: ' + text, 'info');
+      sendCommand();
     }
     stopListening();
   } else {
@@ -118,13 +141,14 @@ function toggleMic() {
 }
 
 async function startListening() {
-  // Request microphone permission first — Chrome extensions need explicit access
+  // Explicitly request microphone permission first — in extension popups,
+  // SpeechRecognition alone may silently fail with "not-allowed".
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    // Got permission — stop the stream immediately (SpeechRecognition manages its own)
-    stream.getTracks().forEach(track => track.stop());
+    // Stop the stream immediately; we only needed it to trigger the permission prompt.
+    stream.getTracks().forEach(t => t.stop());
   } catch (err) {
-    addLog('Microphone access denied — please allow mic in browser settings', 'error');
+    addLog('Microphone access denied — allow mic in browser settings (site: chrome-extension://)', 'error');
     return;
   }
 
@@ -133,6 +157,8 @@ async function startListening() {
   }
 
   try {
+    recognitionResultOffset = 0;
+    recognitionResultCount = 0;
     recognition.start();
     isListening = true;
     const micBtn = document.getElementById('micBtn');
@@ -168,14 +194,19 @@ function updateAudioState() {
     micBtn.disabled = false;
     micBtn.classList.add('ready');
     micBtn.title = 'Click to speak a command';
+    // Auto-start listening, but only if TTS isn't currently speaking
+    if (!isListening && !micPausedByTTS) {
+      startListening();
+    }
   } else {
     micBtn.disabled = true;
     micBtn.classList.remove('ready', 'listening');
     micBtn.title = 'Voice input (enable Audio in Settings)';
     if (isListening && recognition) {
       recognition.stop();
-      stopListening();
+      isListening = false;
     }
+    stopListening();
   }
 
   // Update TTS in background script
@@ -219,7 +250,12 @@ async function startAgent() {
       setStatus('active');
       addLog('Autopilot is active! Type or speak your commands.', 'action');
       document.getElementById('commandInput').focus();
-      updateAudioState();  // Enable mic button if audio is on
+      // Mark mic as paused — the welcome TTS message is about to play.
+      // resumeMic from background.js will start listening after TTS finishes.
+      if (audioEnabled) {
+        micPausedByTTS = true;
+      }
+      updateAudioState();  // Enable mic button (but won't start listening due to micPausedByTTS)
     } else {
       addLog('Failed to start: ' + (response?.error || 'Unknown error'), 'error');
       document.getElementById('startBtn').disabled = false;
@@ -254,6 +290,24 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
   if (msg.type === 'status') {
     setStatus(msg.state);
+  }
+
+  // Pause mic while TTS is speaking to prevent feedback loop
+  if (msg.action === 'pauseMic') {
+    micPausedByTTS = true;
+    if (isListening && recognition) {
+      recognition.stop();
+      isListening = false;
+    }
+  }
+  if (msg.action === 'resumeMic') {
+    if (micPausedByTTS) {
+      micPausedByTTS = false;
+      const audioEnabled = document.getElementById('enableAudio').checked;
+      if (audioEnabled && isRunning) {
+        startListening();
+      }
+    }
   }
 });
 

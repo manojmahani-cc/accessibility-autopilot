@@ -1,20 +1,20 @@
 # ♿ Accessibility Autopilot
 
-> Voice-controlled AI agent that acts as a universal cursor for users with motor disabilities. Built with Gemini 2.0 Flash, Google ADK, and Cloud Run.
+> Voice-controlled AI agent that acts as a universal cursor for users with motor disabilities. Built with Gemini 2.0 Flash, Google Gen AI SDK and Cloud Run.
 
 **Category:** UI Navigator ☸️ | **Hackathon:** Google Gemini AI Hackathon
 
 ---
 
-## 🎥 Demo Video
+<!-- ## 🎥 Demo Video
 
 [Link to your demo video]
 
----
+--- -->
 
 ## 🧩 What It Does
 
-Accessibility Autopilot watches your screen via screenshots, listens to your voice, and performs browser actions (click, type, scroll) on your behalf — across **any web application** without needing accessibility APIs or DOM access.
+Accessibility Autopilot watches your screen via screenshots, listens to your voice, and performs browser actions (click, type, scroll) on your behalf across **any web application** without needing accessibility APIs or DOM access.
 
 **Example flow on Outlook 365:**
 ```
@@ -43,15 +43,11 @@ accessibility-autopilot/
 │   ├── test_autopilot.py       # Full test suite (25 tests)
 │   ├── requirements.txt        # Python dependencies
 │   ├── Dockerfile              # Cloud Run container
-│   └── .env.example            # Environment variable template
+│   └── .env                    # Environment variable template
 ├── chrome-extension/
-│   ├── manifest.json           # Chrome Extension config (Manifest V3)
+│   ├── manifest.json           # Chrome Extension config 
 │   ├── background.js           # Service worker — capture, execute, communicate
 │   ├── popup.html              # Extension UI — start/stop, mic capture, settings
-│   └── icons/                  # Extension icons (16, 48, 128px)
-│       ├── icon16.png
-│       ├── icon48.png
-│       └── icon128.png
 └── README.md
 ```
 
@@ -61,11 +57,11 @@ accessibility-autopilot/
 
 | Technology | Role |
 |---|---|
-| **Gemini 2.0 Flash** (Live API) | Vision understanding, speech processing, action planning |
+| **Gemini 2.5 Flash Lite** (Live API) | Vision understanding, text processing, action planning |
 | **Google GenAI SDK** (Python) | Gemini API client |
 | **Google Cloud Run** | Backend hosting (WebSocket support) |
-| **Google Firestore** | Session storage & user preferences (optional) |
-| **Google Cloud Storage** | Screenshot history buffer (optional) |
+| **Google Firestore** | Session storage & user preferences (future) |
+| **Google Cloud Storage** | Screenshot history buffer (future) |
 | **Chrome Extension** (Manifest V3) | Screen capture, mic input, action execution |
 | **FastAPI + Uvicorn** | Python backend server |
 | **Pillow** | Screenshot preprocessing & grid overlay |
@@ -109,7 +105,7 @@ source venv/bin/activate        # Mac/Linux
 pip install -r requirements.txt
 
 # Set your API key
-cp .env.example .env
+cp .env .env
 # Edit .env and paste your GEMINI_API_KEY
 
 # OR set it directly:
@@ -131,7 +127,7 @@ python test_single_scenario.py
   Step 1: Generate fake Outlook inbox screenshot
   ✅ PASS: Screenshot created (142 KB, 1920x1080)
 
-  Step 3: Send screenshot + voice command to Gemini
+  Step 3: Send screenshot + text command to Gemini
   ✅ PASS: Gemini responded in 1.84s
 
   Step 5: Validate action structure
@@ -272,7 +268,7 @@ python test_autopilot.py TestGridOverlay -v
 
 ## 🎬 Demo Script (2 Minutes)
 
-For judges to reproduce the demo:
+To reproduce the demo:
 
 1. Open Outlook 365 in Chrome with a few test emails in inbox
 2. Start Autopilot via the extension
@@ -298,7 +294,8 @@ Settings available in the extension popup:
 |---|---|---|
 | Screenshot interval | 1500ms | How often to capture the screen |
 | Image quality | 90% | JPEG quality (higher = better accuracy, more bandwidth) |
-| Confirm before actions | ✅ On | Ask user before Send/Delete actions |
+| Confirm before actions | ✅ Off | Ask user before Send/Delete actions |
+| Enable Audio (mic + voice) | ✅ On | Enablement of Audio capture |
 
 ---
 
@@ -311,62 +308,4 @@ Settings available in the extension popup:
 | "Agent clicks the wrong spot" | Ensure browser zoom is exactly 100%. Try increasing image quality to 95%. |
 | "Debugger detached" warning | Normal Chrome security banner. Don't close it — it's needed for click simulation. |
 | "Permission denied" errors | Reload extension at chrome://extensions. Re-grant permissions. |
-| Gemini returns non-JSON | Rare — the backend handles this by treating it as a spoken response. |
 
----
-
-## 💰 Cost
-
-| Usage | Estimated Cost |
-|---|---|
-| Hackathon (10 hrs testing) | ~$1-3 (likely free with Gemini free tier) |
-| Daily use (2 hrs/day, 30 days) | ~$5-15/month |
-
-Google Cloud offers **$300 free credits** for new accounts, and Gemini Flash has a **generous free tier** (1,500 requests/day).
-
----
-
-## 📄 Environment Variables
-
-Create a `backend/.env` file:
-
-```env
-# Required
-GEMINI_API_KEY=your_gemini_api_key_here
-
-# Optional
-PORT=8080
-LOG_LEVEL=INFO
-```
-
----
-
-## 🏗️ Architecture
-
-```
-  Chrome Extension                    Cloud Run (Python)
- ┌────────────────────┐            ┌────────────────────────┐
- │ Tab Screenshot ────┼── WS ────▶│ FastAPI Backend         │
- │ Microphone Audio ──┼── WS ────▶│   ├─▶ Grid Overlay     │
- │ Execute Actions ◀──┼── WS ◀───│   ├─▶ Gemini Live API  │
- │ Play Audio ◀───────┼── WS ◀───│   └─▶ Action Parser    │
- └────────────────────┘            └────────────────────────┘
-```
-
-**Core loop:** Capture screen → Stream to Gemini with voice → Get action + confirmation → Execute click/type/scroll → Verify result → Repeat
-
----
-
-## 🤝 Team
-
-| Name | Role |
-|---|---|
-| [Your Name] | [Your Role] |
-| [Team Member 2] | [Role] |
-| [Team Member 3] | [Role] |
-
----
-
-## 📜 License
-
-MIT License — see [LICENSE](LICENSE) file.

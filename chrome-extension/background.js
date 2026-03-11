@@ -8,6 +8,9 @@ let captureTimer = null;
 let isRunning = false;
 let activeTabId = null;
 let debuggerAttached = false;
+let transportMode = null; // "ws" or "http"
+let httpSessionId = null;
+let pollTimer = null;
 let config = {
   backendUrl: "ws://localhost:8080/ws",
   captureInterval: 1500,
@@ -34,27 +37,36 @@ function setStatus(state) {
 function connectWebSocket() {
   return new Promise((resolve, reject) => {
     try {
+      // Timeout after 5 seconds so we can fall back to HTTP
+      const timeout = setTimeout(() => {
+        if (ws) { ws.close(); ws = null; }
+        reject(new Error("WebSocket connection timed out"));
+      }, 5000);
+
       ws = new WebSocket(config.backendUrl);
 
       ws.onopen = () => {
-        log("Connected to backend", "action");
+        clearTimeout(timeout);
+        log("Connected to backend via WebSocket", "action");
         setStatus("active");
         resolve(true);
       };
 
       ws.onclose = (event) => {
+        clearTimeout(timeout);
         log(`Disconnected from backend (code: ${event.code})`, "error");
         setStatus("inactive");
-        if (isRunning) {
+        if (isRunning && transportMode === "ws") {
           log("Attempting to reconnect in 3 seconds...", "info");
           setTimeout(() => {
-            if (isRunning) connectWebSocket();
+            if (isRunning) connectWebSocket().catch(() => {});
           }, 3000);
         }
       };
 
       ws.onerror = (error) => {
-        log("WebSocket error — check backend URL", "error");
+        clearTimeout(timeout);
+        log("WebSocket error — will try HTTP fallback", "error");
         reject(error);
       };
 
@@ -66,6 +78,92 @@ function connectWebSocket() {
       reject(err);
     }
   });
+}
+
+// ─────────────────────────────────────────────────────────────
+// HTTP Polling Transport — Fallback when WebSocket is blocked
+// ─────────────────────────────────────────────────────────────
+
+function getHttpBaseUrl() {
+  // Convert ws(s)://host/ws → http(s)://host
+  let url = config.backendUrl;
+  url = url.replace(/^wss:\/\//, "https://").replace(/^ws:\/\//, "http://");
+  url = url.replace(/\/ws\/?$/, "");
+  return url;
+}
+
+async function connectHTTP() {
+  const baseUrl = getHttpBaseUrl();
+  log(`Trying HTTP polling: ${baseUrl}`, "info");
+
+  const resp = await fetch(`${baseUrl}/api/connect`, { method: "POST" });
+  if (!resp.ok) throw new Error(`HTTP connect failed: ${resp.status}`);
+
+  const data = await resp.json();
+  httpSessionId = data.session_id;
+  transportMode = "http";
+  log("Connected via HTTP polling", "action");
+  setStatus("active");
+
+  // Process welcome message
+  if (data.messages) {
+    for (const msg of data.messages) handleBackendMessage(JSON.stringify(msg));
+  }
+
+  // Start polling for messages
+  startPolling();
+
+  // Poll once immediately to get the welcome message
+  await pollMessages();
+}
+
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(() => pollMessages(), 2000);
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  httpSessionId = null;
+}
+
+async function pollMessages() {
+  if (!httpSessionId || !isRunning) return;
+  try {
+    const baseUrl = getHttpBaseUrl();
+    const resp = await fetch(`${baseUrl}/api/poll/${httpSessionId}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data.error === "invalid_session") {
+      log("Session expired — reconnecting", "error");
+      await connectHTTP();
+      return;
+    }
+    if (data.messages) {
+      for (const msg of data.messages) handleBackendMessage(JSON.stringify(msg));
+    }
+  } catch (e) {
+    // Polling failure is non-critical, will retry
+  }
+}
+
+async function sendHTTP(payload) {
+  if (!httpSessionId) return;
+  try {
+    const baseUrl = getHttpBaseUrl();
+    const resp = await fetch(`${baseUrl}/api/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: httpSessionId, ...payload }),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data.messages) {
+      for (const msg of data.messages) handleBackendMessage(JSON.stringify(msg));
+    }
+  } catch (e) {
+    log(`HTTP send failed: ${e.message}`, "error");
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -326,8 +424,8 @@ async function executeClick(x, y, confirmation, targetText) {
     }
   }
 
-  // Wait for UI to update, then capture verification screenshot
-  await sleep(800);
+  // Wait for UI to update (Outlook animations can take 1-2s), then capture
+  await sleep(1500);
   await captureAndSend();
   setStatus("active");
 }
@@ -738,14 +836,30 @@ async function speakText(text) {
   }
 
   try {
-    await chrome.tts.speak(text, {
-      rate: 1.0,
-      pitch: 1.0,
-      volume: 1.0,
-      lang: "en-US",
+    // Pause mic so TTS output doesn't get picked up as a voice command
+    chrome.runtime.sendMessage({ action: "pauseMic" }).catch(() => {});
+
+    await new Promise((resolve, reject) => {
+      chrome.tts.speak(text, {
+        rate: 1.0,
+        pitch: 1.0,
+        volume: 1.0,
+        lang: "en-US",
+        onEvent: (event) => {
+          if (event.type === "end" || event.type === "cancelled" || event.type === "error") {
+            resolve();
+          }
+        },
+      });
+      // Fallback timeout in case onEvent never fires
+      setTimeout(resolve, Math.max(5000, text.length * 80));
     });
+
+    // Resume mic after TTS finishes
+    chrome.runtime.sendMessage({ action: "resumeMic" }).catch(() => {});
   } catch (err) {
     log(`TTS failed: ${err.message}`, "error");
+    chrome.runtime.sendMessage({ action: "resumeMic" }).catch(() => {});
   }
 }
 
@@ -772,11 +886,36 @@ async function playAudioBase64(audioBase64) {
 // ─────────────────────────────────────────────────────────────
 // Screen Capture — High quality for Outlook's dense UI
 // ─────────────────────────────────────────────────────────────
+function isConnected() {
+  if (transportMode === "ws") return ws && ws.readyState === WebSocket.OPEN;
+  if (transportMode === "http") return !!httpSessionId;
+  return false;
+}
+
+function sendToBackend(payload) {
+  if (transportMode === "ws" && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
+  } else if (transportMode === "http" && httpSessionId) {
+    sendHTTP(payload);
+  }
+}
+
 async function captureAndSend() {
-  if (!isRunning || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!isRunning || !isConnected()) return;
 
   try {
-    const screenshot = await chrome.tabs.captureVisibleTab(null, {
+    // Ensure we capture the correct tab's window, not DevTools or other windows
+    let windowId = null;
+    try {
+      const tab = await chrome.tabs.get(activeTabId);
+      windowId = tab.windowId;
+      // Make sure the target tab is active in its window
+      await chrome.tabs.update(activeTabId, { active: true });
+    } catch (e) {
+      // Fallback to current window
+    }
+
+    const screenshot = await chrome.tabs.captureVisibleTab(windowId, {
       format: "jpeg",
       quality: config.imageQuality, // 90% for Outlook
     });
@@ -819,14 +958,14 @@ async function captureAndSend() {
     // Store the scale factor for coordinate conversion
     config._scaleFactor = imgDims.width / viewportWidth;
 
-    ws.send(JSON.stringify({
+    sendToBackend({
       type: "screenshot",
       data: base64Data,
       timestamp: Date.now(),
       resolution: `${imgDims.width}x${imgDims.height}`,
       viewportSize: `${viewportWidth}x${viewportHeight}`,
       devicePixelRatio: config._scaleFactor,
-    }));
+    });
   } catch (err) {
     log(`Screenshot capture failed: ${err.message}`, "error");
   }
@@ -842,22 +981,22 @@ async function captureAndSend() {
 
 // Listen for text commands from popup.html
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === "sendText" && ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({
+  if (msg.action === "sendText" && isConnected()) {
+    sendToBackend({
       type: "command",
       text: msg.text,
       timestamp: Date.now(),
-    }));
+    });
     log(`Command sent: ${msg.text}`, "info");
   }
 
   // Listen for user confirmation responses (yes/no)
-  if (msg.action === "sendConfirmation" && ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({
+  if (msg.action === "sendConfirmation" && isConnected()) {
+    sendToBackend({
       type: "user_confirmation",
       response: msg.response,
       timestamp: Date.now(),
-    }));
+    });
     log(`Confirmation sent: ${msg.response}`, "info");
   }
 });
@@ -964,8 +1103,14 @@ async function startAgent(userConfig) {
     // Attach debugger for click/type simulation
     await attachDebugger(tab.id);
 
-    // Connect to backend
-    await connectWebSocket();
+    // Connect to backend — try WebSocket first, fall back to HTTP polling
+    try {
+      await connectWebSocket();
+      transportMode = "ws";
+    } catch (wsErr) {
+      log("WebSocket failed, falling back to HTTP polling...", "info");
+      await connectHTTP();
+    }
 
     // Start screenshot capture loop
     isRunning = true;
@@ -995,6 +1140,9 @@ async function stopAgent() {
     ws.close();
     ws = null;
   }
+
+  stopPolling();
+  transportMode = null;
 
   await detachDebugger();
 
