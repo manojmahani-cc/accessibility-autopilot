@@ -3,6 +3,11 @@
 // Updated for Outlook 365 (higher quality capture + smarter actions)
 // ─────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────
+// Side Panel — open when extension icon is clicked
+// ─────────────────────────────────────────────────────────────
+chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+
 let ws = null;
 let captureTimer = null;
 let isRunning = false;
@@ -194,6 +199,10 @@ async function handleBackendMessage(rawData) {
       await executeType(msg.text, msg.confirmation, msg.target_field);
       break;
 
+    case "replace":
+      await executeReplace(msg.find_text, msg.text, msg.confirmation, msg.target_field);
+      break;
+
     case "scroll":
       await executeScroll(msg.direction, msg.confirmation);
       break;
@@ -264,6 +273,8 @@ async function executeClick(x, y, confirmation, targetText) {
   const viewportY = Math.round(y / scaleFactor);
 
   let clicked = false;
+  let clickX = viewportX;
+  let clickY = viewportY;
 
   // STRATEGY 1: Try to find element by text content (most reliable for Outlook)
   if (targetText) {
@@ -275,57 +286,107 @@ async function executeClick(x, y, confirmation, targetText) {
           expression: `
             (function() {
               const targetText = ${JSON.stringify(targetText)};
+              const hintX = ${viewportX};
+              const hintY = ${viewportY};
+
+              // Distance from element center to Gemini's hint coordinates
+              function distToHint(el) {
+                const r = el.getBoundingClientRect();
+                const cx = r.left + r.width / 2;
+                const cy = r.top + r.height / 2;
+                return Math.sqrt((cx - hintX) ** 2 + (cy - hintY) ** 2);
+              }
+
+              // Check if element is in a toolbar, header, or navigation area
+              function isInChrome(el) {
+                // Toolbars, menubars, banner, navigation, headers
+                if (el.closest('[role="toolbar"], [role="menubar"], [role="banner"], [role="navigation"], header, nav')) return true;
+                // Reading pane header area (To:, From: fields)
+                if (el.closest('[role="complementary"]')) return true;
+                // Very top of the page (< 120px) is usually toolbar/ribbon
+                const r = el.getBoundingClientRect();
+                if (r.top < 120 && r.height < 60) return true;
+                return false;
+              }
+
+              // Pick the best candidate — avoid toolbar/header matches when list alternatives exist
+              function pickClosest(candidates) {
+                if (candidates.length === 0) return null;
+                if (candidates.length === 1) return candidates[0];
+
+                // Separate: elements NOT in toolbar/chrome vs those that are
+                const content = candidates.filter(c => !isInChrome(c.el));
+                const chrome = candidates.filter(c => isInChrome(c.el));
+
+                // Prefer content-area elements (email list, reading pane body)
+                if (content.length > 0) {
+                  content.sort((a, b) => distToHint(a.el) - distToHint(b.el));
+                  return content[0];
+                }
+
+                // Fall back to chrome/toolbar elements
+                chrome.sort((a, b) => distToHint(a.el) - distToHint(b.el));
+                return chrome[0];
+              }
 
               // Helper: find the best clickable element matching the text
               function findByText(text) {
-                // Try multiple strategies to find the element
+                const textLower = text.toLowerCase();
+                // Collect ALL candidates from every strategy, then pick closest at the end
+                let allCandidates = [];
 
                 // Strategy A: aria-label match (buttons, icons)
-                let el = document.querySelector('[aria-label="' + text + '"]');
-                if (el) return { el, method: 'aria-label' };
-
-                // Strategy B: title attribute match
-                el = document.querySelector('[title="' + text + '"]');
-                if (el) return { el, method: 'title' };
-
-                // Strategy C: button/link with exact text
-                const allClickable = document.querySelectorAll('button, a, [role="treeitem"], [role="button"], [role="menuitem"], [role="tab"], [role="option"], [role="link"]');
-                for (const node of allClickable) {
-                  if (node.textContent.trim() === text || node.innerText.trim() === text) {
-                    return { el: node, method: 'exact-text' };
+                const ariaEls = document.querySelectorAll('[aria-label]');
+                for (const el of ariaEls) {
+                  const label = el.getAttribute('aria-label') || '';
+                  if (label === text || label.toLowerCase().includes(textLower)) {
+                    allCandidates.push({ el, method: 'aria-label' });
                   }
                 }
 
-                // Strategy D: any element containing the text (partial match)
+                // Strategy B: title attribute match
+                const titleEls = document.querySelectorAll('[title]');
+                for (const el of titleEls) {
+                  const title = el.getAttribute('title') || '';
+                  if (title === text || title.toLowerCase().includes(textLower)) {
+                    allCandidates.push({ el, method: 'title' });
+                  }
+                }
+
+                // Strategy C: button/link/listitem with matching text
+                const allClickable = document.querySelectorAll('button, a, [role="treeitem"], [role="button"], [role="menuitem"], [role="tab"], [role="option"], [role="link"], [role="listitem"], [data-convid], [role="row"]');
+                for (const node of allClickable) {
+                  const nodeText = (node.textContent || '').trim();
+                  if (nodeText === text || (node.innerText || '').trim() === text) {
+                    allCandidates.push({ el: node, method: 'exact-text' });
+                  }
+                }
+
+                // Strategy D: any element containing the text
                 const walker = document.createTreeWalker(
                   document.body,
                   NodeFilter.SHOW_ELEMENT,
                   null
                 );
-                let bestMatch = null;
-                let bestLen = Infinity;
                 while (walker.nextNode()) {
                   const node = walker.currentNode;
-                  const nodeText = node.textContent.trim();
-                  // Match elements whose direct text content matches
-                  if (nodeText === text || node.innerText?.trim() === text) {
-                    // Prefer smaller (more specific) elements
-                    if (nodeText.length < bestLen) {
-                      bestMatch = node;
-                      bestLen = nodeText.length;
+                  const nodeText = (node.textContent || '').trim();
+                  if (nodeText.toLowerCase().includes(textLower)) {
+                    // Only consider leaf-ish elements (not huge containers)
+                    if (nodeText.length < text.length * 5) {
+                      allCandidates.push({ el: node, method: 'tree-walk' });
                     }
                   }
                 }
-                if (bestMatch) return { el: bestMatch, method: 'tree-walk' };
 
                 // Strategy E: partial/contains match for longer text
                 for (const node of allClickable) {
                   if (node.textContent.includes(text) || text.includes(node.textContent.trim())) {
-                    return { el: node, method: 'partial' };
+                    allCandidates.push({ el: node, method: 'partial' });
                   }
                 }
-
-                return null;
+                // Pick the single best candidate across ALL strategies — closest to hint
+                return pickClosest(allCandidates);
               }
 
               const match = findByText(targetText);
@@ -361,7 +422,10 @@ async function executeClick(x, y, confirmation, targetText) {
         const clickResult = JSON.parse(result.result.value);
         if (clickResult.found) {
           log(`Text-click "${targetText}" → ${clickResult.tag} via ${clickResult.method} at (${clickResult.cx}, ${clickResult.cy})`, "action");
-          await showClickIndicator(clickResult.cx, clickResult.cy);
+          // Use the element's coordinates for a proper mouse-event click
+          // instead of relying on .click() which Outlook/React often ignores
+          clickX = clickResult.cx;
+          clickY = clickResult.cy;
           clicked = true;
         }
       }
@@ -370,58 +434,61 @@ async function executeClick(x, y, confirmation, targetText) {
     }
   }
 
-  // STRATEGY 2: Fall back to coordinate-based clicking
+  // Use coordinates from text-match or fall back to Gemini's coordinates
   if (!clicked) {
+    clickX = viewportX;
+    clickY = viewportY;
     log(`Coordinate click at (${x}, ${y}) → viewport (${viewportX}, ${viewportY}) [scale=${scaleFactor}]`, "action");
+  }
 
+  // Dispatch real mouse events — required for React/Fluent UI (Outlook)
+  try {
+    await showClickIndicator(clickX, clickY);
+    await sleep(300);
+
+    // Move mouse to target first (required by React)
+    await chrome.debugger.sendCommand(
+      { tabId: activeTabId },
+      "Input.dispatchMouseEvent",
+      { type: "mouseMoved", x: clickX, y: clickY }
+    );
+    await sleep(50);
+
+    // Mouse down
+    await chrome.debugger.sendCommand(
+      { tabId: activeTabId },
+      "Input.dispatchMouseEvent",
+      { type: "mousePressed", x: clickX, y: clickY, button: "left", clickCount: 1 }
+    );
+    await sleep(30);
+
+    // Mouse up
+    await chrome.debugger.sendCommand(
+      { tabId: activeTabId },
+      "Input.dispatchMouseEvent",
+      { type: "mouseReleased", x: clickX, y: clickY, button: "left", clickCount: 1 }
+    );
+
+    // JS click fallback for elements that need it (sidebar, buttons)
     try {
-      await showClickIndicator(viewportX, viewportY);
-      await sleep(300);
-
-      // Move mouse to target first (required by React)
       await chrome.debugger.sendCommand(
         { tabId: activeTabId },
-        "Input.dispatchMouseEvent",
-        { type: "mouseMoved", x: viewportX, y: viewportY }
+        "Runtime.evaluate",
+        {
+          expression: `
+            (function() {
+              const el = document.elementFromPoint(${clickX}, ${clickY});
+              if (el) { el.click(); return 'clicked: ' + el.tagName; }
+              return 'no element';
+            })();
+          `,
+        }
       );
-      await sleep(50);
+    } catch (e) { /* non-critical */ }
 
-      // Mouse down
-      await chrome.debugger.sendCommand(
-        { tabId: activeTabId },
-        "Input.dispatchMouseEvent",
-        { type: "mousePressed", x: viewportX, y: viewportY, button: "left", clickCount: 1 }
-      );
-      await sleep(30);
-
-      // Mouse up
-      await chrome.debugger.sendCommand(
-        { tabId: activeTabId },
-        "Input.dispatchMouseEvent",
-        { type: "mouseReleased", x: viewportX, y: viewportY, button: "left", clickCount: 1 }
-      );
-
-      // JS click fallback on element at coordinates
-      try {
-        await chrome.debugger.sendCommand(
-          { tabId: activeTabId },
-          "Runtime.evaluate",
-          {
-            expression: `
-              (function() {
-                const el = document.elementFromPoint(${viewportX}, ${viewportY});
-                if (el) { el.click(); return 'clicked: ' + el.tagName; }
-                return 'no element';
-              })();
-            `,
-          }
-        );
-      } catch (e) { /* non-critical */ }
-
-      log(`Click executed at viewport (${viewportX}, ${viewportY})`, "action");
-    } catch (err) {
-      log(`Click failed: ${err.message}`, "error");
-    }
+    log(`Click executed at (${clickX}, ${clickY})`, "action");
+  } catch (err) {
+    log(`Click failed: ${err.message}`, "error");
   }
 
   // Wait for UI to update (Outlook animations can take 1-2s), then capture
@@ -512,12 +579,13 @@ async function executeType(text, confirmation, targetField) {
               if (el) {
                 el.focus();
                 el.click();
-                // For contenteditable, place cursor at end
+                // For contenteditable, place cursor at the beginning (top of reply body)
                 if (el.getAttribute('contenteditable') === 'true') {
                   const range = document.createRange();
                   const sel = window.getSelection();
+                  // Place cursor at the very start of the editable area
                   range.selectNodeContents(el);
-                  range.collapse(false);
+                  range.collapse(true);  // true = collapse to start
                   sel.removeAllRanges();
                   sel.addRange(range);
                 }
@@ -538,7 +606,47 @@ async function executeType(text, confirmation, targetField) {
         const res = JSON.parse(focusResult.result.value);
         if (res.found) {
           log(`Focused ${targetField} field (${res.tag}, ${res.type})`, "action");
-          await sleep(200);  // Let Outlook register the focus
+          await sleep(1500);  // Let Outlook fully register the focus (reply compose needs extra time)
+
+          // Re-focus and re-click to ensure focus wasn't stolen during compose initialization
+          await chrome.debugger.sendCommand(
+            { tabId: activeTabId },
+            "Runtime.evaluate",
+            {
+              expression: `
+                (function() {
+                  const field = '${targetField.replace(/'/g, "\\'")}';
+                  let el = null;
+                  if (field === 'body' || field === 'message body' || field === 'email body') {
+                    const editables = document.querySelectorAll('[contenteditable="true"][role="textbox"], [contenteditable="true"]');
+                    let maxArea = 0;
+                    for (const ed of editables) {
+                      const rect = ed.getBoundingClientRect();
+                      const area = rect.width * rect.height;
+                      if (area > maxArea && rect.width > 200 && rect.height > 100) {
+                        maxArea = area;
+                        el = ed;
+                      }
+                    }
+                  }
+                  if (el) {
+                    el.focus();
+                    el.click();
+                    if (el.getAttribute('contenteditable') === 'true') {
+                      const range = document.createRange();
+                      const sel = window.getSelection();
+                      range.selectNodeContents(el);
+                      range.collapse(true);  // true = collapse to start (top of reply)
+                      sel.removeAllRanges();
+                      sel.addRange(range);
+                    }
+                  }
+                })();
+              `,
+              returnByValue: true,
+            }
+          );
+          await sleep(300);
         } else {
           log(`Could not find "${targetField}" field — typing into current focus`, "error");
         }
@@ -548,9 +656,11 @@ async function executeType(text, confirmation, targetField) {
     // Normalize newlines: replace literal \n sequences with actual newline chars
     const normalizedText = text.replace(/\\n/g, '\n');
 
-    // Type each character with a small delay for Outlook to process
-    for (const char of normalizedText) {
-      if (char === '\n' || char === '\r') {
+    // Split by newlines — use insertText for text chunks (reliable for rich text
+    // editors like Outlook) and keyDown/keyUp for Enter keys
+    const lines = normalizedText.split(/(\r?\n)/);
+    for (const segment of lines) {
+      if (segment === '\n' || segment === '\r\n') {
         // Press Enter for newlines
         await chrome.debugger.sendCommand(
           { tabId: activeTabId },
@@ -575,43 +685,198 @@ async function executeType(text, confirmation, targetField) {
           }
         );
         await sleep(50);
-        continue;
+      } else if (segment.length > 0) {
+        // Use Input.insertText — inserts text at cursor reliably without
+        // dropping the first character (unlike keyDown which Outlook can swallow)
+        await chrome.debugger.sendCommand(
+          { tabId: activeTabId },
+          "Input.insertText",
+          { text: segment }
+        );
+        await sleep(50);
       }
-
-      await chrome.debugger.sendCommand(
-        { tabId: activeTabId },
-        "Input.dispatchKeyEvent",
-        {
-          type: "keyDown",
-          text: char,
-          unmodifiedText: char,
-          key: char,
-        }
-      );
-
-      await chrome.debugger.sendCommand(
-        { tabId: activeTabId },
-        "Input.dispatchKeyEvent",
-        {
-          type: "keyUp",
-          text: char,
-          unmodifiedText: char,
-          key: char,
-        }
-      );
-
-      // Small delay between characters — Outlook's rich text editor
-      // can drop characters if typed too fast
-      await sleep(30);
     }
 
-    log(`Typed ${text.length} characters`, "action");
+    log(`Typed ${text.length} characters via Input.insertText`, "action");
+
+    // Verify text was actually inserted; if not, retry with execCommand fallback
+    await sleep(300);
+    const searchText = JSON.stringify(text.replace(/\\n/g, '\n').trim());
+    const verifyResult = await chrome.debugger.sendCommand(
+      { tabId: activeTabId },
+      "Runtime.evaluate",
+      {
+        expression: `
+          (function() {
+            const textToFind = ${searchText};
+            const editables = document.querySelectorAll('[contenteditable="true"][role="textbox"], [contenteditable="true"]');
+            for (const ed of editables) {
+              if (ed.innerText && ed.innerText.includes(textToFind)) {
+                return JSON.stringify({ verified: true });
+              }
+            }
+            return JSON.stringify({ verified: false });
+          })();
+        `,
+        returnByValue: true,
+      }
+    );
+
+    let verified = false;
+    if (verifyResult && verifyResult.result && verifyResult.result.value) {
+      verified = JSON.parse(verifyResult.result.value).verified;
+    }
+
+    if (!verified) {
+      log("Text not detected after Input.insertText — retrying with execCommand fallback", "action");
+      // Fallback: use execCommand('insertText') which works directly on the focused contenteditable
+      await chrome.debugger.sendCommand(
+        { tabId: activeTabId },
+        "Runtime.evaluate",
+        {
+          expression: `
+            (function() {
+              let el = null;
+              const editables = document.querySelectorAll('[contenteditable="true"][role="textbox"], [contenteditable="true"]');
+              let maxArea = 0;
+              for (const ed of editables) {
+                const rect = ed.getBoundingClientRect();
+                const area = rect.width * rect.height;
+                if (area > maxArea && rect.width > 200 && rect.height > 100) {
+                  maxArea = area;
+                  el = ed;
+                }
+              }
+              if (el) {
+                el.focus();
+                const range = document.createRange();
+                const sel = window.getSelection();
+                // Place cursor at the start for reply body
+                range.selectNodeContents(el);
+                range.collapse(true);
+                sel.removeAllRanges();
+                sel.addRange(range);
+                document.execCommand('insertText', false, ${searchText});
+                return JSON.stringify({ fallback: true, success: true });
+              }
+              return JSON.stringify({ fallback: true, success: false });
+            })();
+          `,
+          returnByValue: true,
+        }
+      );
+      log("Fallback execCommand('insertText') executed", "action");
+    } else {
+      log("Text verified in DOM", "action");
+    }
 
     // Capture new screenshot after typing
     await sleep(500);
     await captureAndSend();
   } catch (err) {
     log(`Type failed: ${err.message}`, "error");
+  }
+
+  setStatus("active");
+}
+
+async function executeReplace(findText, replaceText, confirmation, targetField) {
+  if (!debuggerAttached || !activeTabId) {
+    log("Cannot replace — debugger not attached", "error");
+    return;
+  }
+  if (!findText || !replaceText) {
+    log("Replace action missing find_text or text", "error");
+    return;
+  }
+
+  setStatus("processing");
+  log(`Replacing "${findText}" → "${replaceText}"${targetField ? ` in [${targetField}]` : ''}`, "action");
+
+  try {
+    // Find the target field and do the replacement via DOM
+    const result = await chrome.debugger.sendCommand(
+      { tabId: activeTabId },
+      "Runtime.evaluate",
+      {
+        expression: `
+          (function() {
+            const findText = ${JSON.stringify(findText)};
+            const replaceText = ${JSON.stringify(replaceText)};
+            const field = ${JSON.stringify(targetField || 'body')}.toLowerCase();
+
+            // Find the target element
+            let el = null;
+            if (field === 'body' || field === 'message body' || field === 'email body') {
+              const editables = document.querySelectorAll('[contenteditable="true"][role="textbox"], [contenteditable="true"]');
+              let maxArea = 0;
+              for (const ed of editables) {
+                const rect = ed.getBoundingClientRect();
+                const area = rect.width * rect.height;
+                if (area > maxArea && rect.width > 200 && rect.height > 100) {
+                  maxArea = area;
+                  el = ed;
+                }
+              }
+            } else if (field.includes('subject')) {
+              el = document.querySelector('input[aria-label*="ubject" i], input[placeholder*="ubject" i]');
+            }
+
+            if (!el) {
+              // Try any focused or active contenteditable
+              el = document.activeElement;
+              if (!el || (!el.isContentEditable && el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA')) {
+                return JSON.stringify({ success: false, reason: 'no target field found' });
+              }
+            }
+
+            // Do the replacement
+            if (el.isContentEditable) {
+              const html = el.innerHTML;
+              if (html.includes(findText)) {
+                el.innerHTML = html.replace(findText, replaceText);
+                // Trigger input event so Outlook registers the change
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                return JSON.stringify({ success: true, method: 'innerHTML' });
+              }
+              // Try textContent for plain text match
+              const text = el.textContent;
+              if (text.includes(findText)) {
+                el.textContent = text.replace(findText, replaceText);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                return JSON.stringify({ success: true, method: 'textContent' });
+              }
+            } else {
+              // Input/textarea
+              const val = el.value;
+              if (val.includes(findText)) {
+                el.value = val.replace(findText, replaceText);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return JSON.stringify({ success: true, method: 'value' });
+              }
+            }
+
+            return JSON.stringify({ success: false, reason: 'text not found: ' + findText });
+          })();
+        `,
+        returnByValue: true,
+      }
+    );
+
+    if (result && result.result && result.result.value) {
+      const res = JSON.parse(result.result.value);
+      if (res.success) {
+        log(`Replaced "${findText}" → "${replaceText}" via ${res.method}`, "action");
+      } else {
+        log(`Replace failed: ${res.reason}`, "error");
+      }
+    }
+
+    await sleep(500);
+    await captureAndSend();
+  } catch (err) {
+    log(`Replace failed: ${err.message}`, "error");
   }
 
   setStatus("active");

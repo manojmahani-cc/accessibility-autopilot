@@ -8,7 +8,8 @@
     "debugger",
     "activeTab",
     "tabs",
-    "tts"
+    "tts",
+    "sidePanel"
   ],
   "host_permissions": [
     "https://outlook.office.com/*",
@@ -21,8 +22,10 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_popup": "popup.html",
     "default_title": "Accessibility Autopilot"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
